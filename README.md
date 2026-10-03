@@ -1,0 +1,131 @@
+1. App bootstrap (App.tsx)
+APP:
+  wrap everything in providers, outermost → innermost:
+    I18nextProvider(i18n)        // translations
+      ThemeProvider              // light / dark mode
+        AuthProvider             // who is signed in
+          BankingProvider        // live money data + actions
+            BrowserRouter(basename = __BASE_PATH__)
+              <AppRoutes/>       // renders the matching page
+2. Routing (router/config.tsx)
+ROUTES:
+  "/"            -> Home          (public)
+  "/signin"      -> SignIn        (public)
+  "/terms"       -> Terms         (public)
+  "/dashboard"   -> Protected(Dashboard)
+  "/transfer"    -> Protected(Transfer)
+  "/deposit"     -> Protected(Deposit)
+  "/wallet"      -> Protected(Wallet)
+  "/cards"       -> Protected(Cards)
+  "/profile"     -> Protected(Profile)
+  "/alerts"      -> Protected(Alerts)
+  "/statements"  -> Protected(Statements)
+  "/apply-loan"  -> Protected(ApplyLoan)
+  "/add-account" -> Protected(AddAccount)
+  "/pay-online"  -> Protected(PayOnline)
+  "*"            -> NotFound
+PROTECTED(Page):
+  if auth still loading:  show "Securing your session…" spinner
+  if no user:             redirect to /signin (remember where they came from)
+  else:                   render Page
+3. Supabase client (lib/supabase.ts)
+supabase = createClient(VITE_PUBLIC_SUPABASE_URL, VITE_PUBLIC_SUPABASE_ANON_KEY)
+// one shared instance for the entire app
+4. Auth layer (lib/auth.tsx)
+STATE: user, ready
+ON MOUNT:
+  subscribe to supabase.auth.onAuthStateChange:
+    if session exists -> set user stub, then loadProfile() async
+    else               -> user = null
+    ready = true                       // callback stays synchronous
+  also call auth.getSession() once:
+    ready = true
+    if session -> loadProfile()
+LOAD_PROFILE(id, email):
+  try: read profiles where id = id   // best effort
+  return { id, email, username, name or "Account holder" }
+SIGN_IN(username, password):
+  // ensure the demo account + seed data exist (only runs the very first time)
+  invoke edge function "bootstrap-demo"
+  email = lower(username) + "@firstfederal.bank"
+  result = auth.signInWithPassword(email, password)
+  if error -> "Those details do not match our records."
+  else     -> ok
+SIGN_OUT():
+  auth.signOut(); user = null
+5. Data layer — the core (lib/banking.tsx)
+This is the heart. One provider loads everything for whoever’s signed in.
+
+STATE:
+  loading, error
+  profile, accounts, transactions, cards, alerts,
+  statements, payees, wallet, walletActivity
+WHEN user CHANGES -> load()
+LOAD():
+  if no user:
+    clear everything; loading = false; return
+  loading = true; error = ""
+  try:
+    run 9 queries in PARALLEL, all filtered by user_id:
+      profiles, accounts, transactions, cards, alerts,
+      statements, payees, wallets, wallet_activity
+      (mostly ordered by sort_order / date)
+    if any query errored -> throw
+    normalize each row into clean typed objects
+    transactionsByAccount = group transactions by account id   // memoized
+  catch e:
+    error = e.message          // page shows this + a Retry button
+  finally:
+    loading = false
+MONEY ACTIONS (each calls a DB function, then reloads):
+  transferFunds(from, to, amount, memo) -> rpc transfer_funds -> load()
+  depositFunds(account, amount, method) -> rpc deposit_funds -> load()
+  payPayee(payee, from, amount)         -> rpc pay_payee     -> load()
+  walletTopUp(amount, from)             -> rpc wallet_top_up -> load()
+  // each returns { ok, reference? } or { ok:false, error }
+DIRECT EDITS (optimistic local update):
+  setAlertEnabled(id, enabled) -> update alerts row -> patch local state
+  setCardFrozen(id, frozen)    -> update cards row  -> patch local state
+  updateProfile(patch)         -> update profiles   -> load()
+  openAccount(name,type,apy)   -> insert accounts row -> load()
+  applyLoan(product,...)       -> insert loan_applications -> returns reference
+6. Backend (Supabase)
+TABLES (all RLS-protected, owner-only):
+  profiles, accounts, transactions, cards, alerts,
+  statements, payees, wallets, wallet_activity,
+  transfers, loan_applications
+FUNCTIONS:
+  transfer_funds / deposit_funds / pay_payee / wallet_top_up
+  // atomic: move money, write transaction rows, return a reference number
+EDGE FUNCTION "bootstrap-demo" (public, runs before sign-in):
+  if demo user "mich9090@firstfederal.bank" doesn't exist:
+    create it (email confirmed, password "Mushroom@100")
+  upsert profile for Michael S. Williamson
+  if he already has accounts: stop (already seeded)
+  else insert: 3 accounts, ~27 transactions (5 months),
+               2 cards, 5 alerts, 5 statements, 4 payees,
+               wallet + 5 wallet activities
+7. Pages (all consume useBanking())
+HOME        -> marketing/site pages + hero film + login funnel to /signin
+SIGNIN      -> form -> useAuth().signIn() -> redirect to /dashboard
+DASHBOARD   -> total = sum(accounts.available)
+               changeToday = sum of newest day's transactions
+               render BalanceHero, MyCards, UpcomingPayment,
+                      TransactionsPreview, AccountCard list
+TRANSFER    -> form -> useBanking().transferFunds() -> show reference
+DEPOSIT     -> form -> depositFunds()
+WALLET      -> show balance + activity, top-up via walletTopUp()
+CARDS       -> list cards, freeze toggle (persists via setCardFrozen)
+ALERTS      -> toggle list (persists via setAlertEnabled)
+STATEMENTS  -> list months
+APPLY-LOAN  -> form -> applyLoan() -> show reference
+ADD-ACCOUNT -> form -> openAccount() -> new account appears
+PAY-ONLINE  -> payee list -> payPayee()
+PROFILE     -> edit fields -> updateProfile()
+Every data page follows the same shape:
+
+PAGE:
+  { loading, error, ..., refresh } = useBanking()
+  if loading -> spinner
+  if error   -> message + [Retry] button (calls refresh)
+  else       -> render the real data
